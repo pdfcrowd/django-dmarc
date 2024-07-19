@@ -7,12 +7,12 @@
 DMARC urls
 http://dmarc.org/resources/specification/
 """
-from django.conf.urls import url
+from django.urls import re_path
 from dmarc import views
 
 app_name = 'dmarc'
 urlpatterns = [
-    url("^report/$", views.dmarc_report, name='dmarc_report'),
-    url("^report/csv/$", views.dmarc_csv, name='dmarc_csv'),
-    url("^report/json/$", views.dmarc_json, name='dmarc_json'),
+    re_path("^report/$", views.dmarc_report, name='dmarc_report'),
+    re_path("^report/csv/$", views.dmarc_csv, name='dmarc_csv'),
+    re_path("^report/json/$", views.dmarc_json, name='dmarc_json'),
 ]
