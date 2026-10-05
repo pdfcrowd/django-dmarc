@@ -95,6 +95,26 @@ class Command(BaseCommand):
             logger.error(msg)
             return None
 
+        # Normalize only the report's supported DMARC namespace. Keep foreign
+        # extension names distinct and preserve dmarc_xml for report storage.
+        for namespace in ('urn:ietf:params:xml:ns:dmarc-2.0',
+                          'http://dmarc.org/dmarc-xml/0.1'):
+            prefix = f'{{{namespace}}}'
+            if root.tag == f'{prefix}feedback':
+                for node in root.iter():
+                    if node.tag.startswith(prefix):
+                        node.tag = node.tag[len(prefix):]
+                break
+
+        if root.tag != 'feedback':
+            raise CommandError(
+                f'Expected a DMARC feedback root element, got {root.tag!r}'
+            )
+        # Check both sections before creating a Reporter or any report rows.
+        for tag in ('report_metadata', 'policy_published'):
+            if root.find(tag) is None:
+                raise CommandError(f'Missing required DMARC element: {tag}')
+
         # Report metadata
         report_metadata = root.findall('report_metadata')
         org_name = None
