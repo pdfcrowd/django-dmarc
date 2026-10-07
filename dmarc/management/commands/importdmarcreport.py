@@ -18,18 +18,18 @@ from io import BytesIO
 from argparse import FileType
 
 from django.db.utils import IntegrityError
-from django.db import Error
-from django.core.exceptions import ObjectDoesNotExist
+from django.db import Error, transaction
 from django.core.management.base import BaseCommand, CommandError
 
 import pytz
 
+from dmarc.exceptions import InvalidDMARCReport
 from dmarc.models import Reporter, Report, Record, Result
 
 class Command(BaseCommand):
     """
     Command class for importing DMARC Aggregate Reports
-    Most errors are not raised to prevent email bounces
+    Invalid reports and database errors are raised without partial imports.
     """
     help = 'Imports a DMARC Aggregate Report from either email or xml'
 
@@ -45,6 +45,7 @@ class Command(BaseCommand):
             help='Import from xml file, or - for stdin'
         )
 
+    @transaction.atomic
     def handle(self, *args, **options):
         """
         Handle method to import a DMARC Aggregate Reports
@@ -90,10 +91,9 @@ class Command(BaseCommand):
         tz_utc = pytz.timezone('UTC')
         try:
             root = ET.fromstring(dmarc_xml)
-        except:
-            msg = "Processing xml failed: {}".format(dmarc_xml)
-            logger.error(msg)
-            return None
+        except ET.ParseError as err:
+            msg = f'Processing DMARC XML failed: {err}'
+            raise InvalidDMARCReport(msg) from err
 
         # Normalize only the report's supported DMARC namespace. Keep foreign
         # extension names distinct and preserve dmarc_xml for report storage.
@@ -107,13 +107,15 @@ class Command(BaseCommand):
                 break
 
         if root.tag != 'feedback':
-            raise CommandError(
+            raise InvalidDMARCReport(
                 f'Expected a DMARC feedback root element, got {root.tag!r}'
             )
         # Check both sections before creating a Reporter or any report rows.
         for tag in ('report_metadata', 'policy_published'):
             if root.find(tag) is None:
-                raise CommandError(f'Missing required DMARC element: {tag}')
+                raise InvalidDMARCReport(
+                    f'Missing required DMARC element: {tag}'
+                )
 
         # Report metadata
         report_metadata = root.findall('report_metadata')
@@ -139,22 +141,13 @@ class Command(BaseCommand):
         if report_id is None:
             msg = "This DMARC report for {} does not have a report_id".format(org_name)
             logger.error(msg)
-        try:
-            reporter = Reporter.objects.get(org_name=org_name)
-        except ObjectDoesNotExist:
-            try:
-                reporter = Reporter.objects.create(org_name=org_name, email=email)
-            except Error as err:
-                msg = "Unable to create DMARC report for {}: {}".format(org_name, err)
-                logger.error(msg)
-
         # Reporting policy
         policy_published = root.findall('policy_published')
         # Set defaults
         policy_domain = None
         policy_adkim = 'r'
         policy_aspf = 'r'
-        policy_p = 'none'
+        policy_p = None
         policy_sp = 'none'
         policy_pct = 0
         for node in policy_published[0]:
@@ -170,6 +163,28 @@ class Command(BaseCommand):
                 policy_sp = node.text
             if node.tag == 'pct':
                 policy_pct = int(node.text)
+
+        invalid_policy = []
+        for field, value, allowed in (
+            ('adkim', policy_adkim, ('r', 's')),
+            ('aspf', policy_aspf, ('r', 's')),
+            ('p', policy_p, ('none', 'quarantine', 'reject')),
+            ('sp', policy_sp, ('none', 'quarantine', 'reject')),
+        ):
+            if value not in allowed:
+                expected = ', '.join(repr(option) for option in allowed)
+                invalid_policy.append(
+                    f'policy_published.{field}={value!r}; expected {expected}'
+                )
+        if invalid_policy:
+            raise InvalidDMARCReport(
+                f'Invalid DMARC report {report_id}: '
+                + '; '.join(invalid_policy)
+            )
+
+        reporter, _ = Reporter.objects.get_or_create(
+            org_name=org_name, defaults={'email': email},
+        )
 
         # Create the report
         report = Report()
@@ -192,14 +207,23 @@ class Command(BaseCommand):
         report.policy_pct = policy_pct
         report.report_xml = dmarc_xml
         try:
-            report.save()
+            # A savepoint keeps the outer transaction usable for duplicate
+            # detection after an IntegrityError, including concurrent imports.
+            with transaction.atomic():
+                report.save()
         except IntegrityError as err:
+            if not Report.objects.filter(
+                reporter=reporter, report_id=report_id,
+                date_begin=report_date_begin,
+            ).exists():
+                raise
             msg = "DMARC duplicate report record: {}".format(err)
             logger.error(msg)
             return None
         except Error as err:
             msg = "Unable to save the DMARC report header {}: {}".format(report_id, err)
             logger.error(msg)
+            raise
 
         # Record
         for node in root.findall('record'):
@@ -251,12 +275,10 @@ class Command(BaseCommand):
                 record.save()
                 msg = "DMARC record saved"
                 logger.debug(msg)
-            except IntegrityError as err:
-                msg = "DMARC duplicate record: {}".format(err)
-                logger.error(msg)
             except Error as err:
                 msg = "Unable to save the DMARC report record: {}".format(err)
                 logger.error(msg)
+                raise
 
             auth_results = node.find('auth_results')
             for resulttype in auth_results:
@@ -280,6 +302,7 @@ class Command(BaseCommand):
                     msg = ("Unable to save the DMARC report result {} for {}: {}"
                         ).format(resulttype.tag, result_domain, err)
                     logger.error(msg)
+                    raise
 
     def get_xml_from_email(self, email):
         """Get xml from an email
